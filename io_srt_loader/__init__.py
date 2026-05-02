@@ -3,9 +3,8 @@ bl_info = {
 	"author": "Qirashi",
 	"version": (1, 0, 0),
 	"blender": (4, 5, 0),
-	"location": "File > Import",
 	"description": "Import .srt files version 06.0.0.",
-	"doc_url": "https://github.com/",
+	"doc_url": "https://github.com/qirashi/Blender-SRT-Loader",
 	"category": "Import-Export",
 }
 

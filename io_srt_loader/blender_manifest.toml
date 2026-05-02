@@ -1,0 +1,19 @@
+# Blender Extension Manifest
+schema_version = "1.0.0"
+
+id = "io_srt_loader"
+version = "1.0.0"
+name = "SRT Loader (.srt)"
+tagline = "Import .srt files version 06.0.0."
+type = "add-on"
+
+blender_version_min = "4.5.0"
+maintainer = "Qirashi"
+
+license = ["SPDX:GPL-3.0-or-later"]
+website = "https://github.com/qirashi/Blender-SRT-Loader"
+
+description = """An independent Blender add-on that provides support for importing .srt files (SpeedTree® format, version 06.0.0).
+It automatically creates materials with main DDS textures and groups geometry by LOD into collections."""
+
+permissions = ["files"]
