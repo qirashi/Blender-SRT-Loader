@@ -2,22 +2,27 @@
 import struct
 
 
-class eSRT:
-	SIZE_RENDER_STATE_BLOCK = 680
-	SIZE_GEOM_DESCRIPTOR    = 40
-	SIZE_LOD_TABLE_ENTRY    = 24
-	SIZE_AUX_DATA_ENTRY     = 48
-	SIZE_COLLISION_OBJECT   = 36
+class CoordSysType:
+	Y_UP_RIGHT = 0
+	Z_UP_RIGHT = 1
+	Y_UP_LEFT = 2
+	Z_UP_LEFT = 3
 
-	VF_DESC_OFFSET          = 33
-	VF_DESC_SIZE            = 13
-	STRIDE_BYTE_OFFSET      = 663
+class eSRTConstants:
+	RENDER_STATE_SIZE           = 680
+	DRAW_CALL_SIZE              = 40
+	LOD_TABLE_ENTRY_SIZE        = 24
+	BONE_SIZE                   = 48
+	COLLISION_OBJECT_SIZE       = 36
 
-	BILLBOARD_BLOB0_FACTOR  = 16
-	BILLBOARD_FOOTER_SIZE   = 84
+	VF_DESC_OFFSET              = 33
+	VF_DESC_SIZE                = 13
+	STRIDE_BYTE_OFFSET          = 663
 
-	ADDITIONAL_DATA_SIZE    = 31
-	WIND_DATA_SIZE          = 1308
+	HORIZONTAL_BILLBOARD_SIZE   = 84  # 1 int + 20 floats
+
+	ADDITIONAL_DATA_SIZE        = 31
+	WIND_DATA_SIZE              = 1308
 
 class SRTParser:
 	def __init__(self, data):
@@ -60,25 +65,30 @@ class SRTParser:
 			self.pos += 1
 
 
+	#  Top-level parse sections ---------------------------------------------------------
 	def _parse_header(self):
 		header = self._read_string()
 		if header != "SRT 06.0.0":
 			raise ValueError(f"Invalid header: {header}")
-		self.pos = 16  # пропуск заполнения до границы 16 байт
+		self.pos = 16  # skip padding to 16-byte boundary
 		return {"header": header}
 
 	def _parse_platform(self):
+		"""Matches C++ CParser::ParsePlatform: endian byte, coord system, texcoords flipped, reserved"""
 		self.endian_byte = self._read_byte()
 		self.coord_system = self._read_byte()
+		self.texcoords_flipped = self._read_byte() == 1
+		self._read_byte()  # reserved
+
 		self.is_native_endian = self.endian_byte == 0
 		self.endian = '<' if self.is_native_endian else '>'
-		self._read_byte() # reserve?
-		self._read_byte() # reserve?
+
 		self.platform = {
 			'endian_byte': self.endian_byte,
 			'coord_system': self.coord_system,
+			'texcoords_flipped': self.texcoords_flipped,
 			'is_native_endian': self.is_native_endian,
-			'byte_order': 'little' if self.is_native_endian else 'big'
+			'byte_order': 'little' if self.is_native_endian else 'big',
 		}
 		return {"platform": self.platform}
 
@@ -93,16 +103,18 @@ class SRTParser:
 		return {"extents": {"min": extents[:3], "max": extents[3:]}}
 
 	def _parse_lod(self):
+		"""Matches SLodProfile: enabled flag + 4 float distances"""
 		lod_enabled = self._read_int()
 		lod_data = [self._read_float() for _ in range(4)]
 		return {"lod": {"enabled": bool(lod_enabled), "ranges": lod_data}}
 
 	def _parse_wind(self):
-		wind_data = self._read_bytes(eSRT.WIND_DATA_SIZE)
+		"""Wind parameters blob of fixed size (covers SPairParams + options + tree data)"""
+		wind_data = self._read_bytes(eSRTConstants.WIND_DATA_SIZE)
 		return {"wind": wind_data}
 
 	def _parse_additional(self):
-		additional = self._read_bytes(eSRT.ADDITIONAL_DATA_SIZE)
+		additional = self._read_bytes(eSRTConstants.ADDITIONAL_DATA_SIZE)
 		self._align_to_4()
 		return {"additional": additional}
 
@@ -116,6 +128,7 @@ class SRTParser:
 		return {"string_table_preamble": preamble}
 
 	def _parse_string_table(self):
+		"""Matches CParser::ParseStringTable: count, padded lengths, then string data"""
 		try:
 			count = self._read_int()
 			if count > 10000 or self.pos + count * 8 > len(self.data):
@@ -123,8 +136,8 @@ class SRTParser:
 
 			entries = []
 			for _ in range(count):
-				size_a = self._read_int()
-				size_b = self._read_int()
+				size_a = self._read_int()  # padding (4 bytes)
+				size_b = self._read_int()  # actual string length
 				entries.append({"size_a": size_a, "size_b": size_b})
 
 			strings_base = self.pos
@@ -156,73 +169,100 @@ class SRTParser:
 	def _parse_collision_objects(self):
 		try:
 			count = self._read_int()
-			if count > 1000 or self.pos + count * eSRT.SIZE_COLLISION_OBJECT > len(self.data):
+			if count > 1000 or self.pos + count * eSRTConstants.COLLISION_OBJECT_SIZE > len(self.data):
 				return {"collision_objects": "Invalid count or insufficient data"}
 			objects = []
 			for _ in range(count):
-				objects.append(self._read_bytes(eSRT.SIZE_COLLISION_OBJECT))
+				objects.append(self._read_bytes(eSRTConstants.COLLISION_OBJECT_SIZE))
 			return {"collision_objects": {"count": count, "objects": objects}}
 		except Exception:
 			return {"collision_objects": "Parse error"}
 
+
+	#  Billboard parsing (matches C++ vertical + horizontal structures) ---------------------------------------------------------
 	def _parse_billboards(self):
+		"""Parse vertical billboards followed by horizontal billboard (formerly 'footer')"""
 		try:
-			origin = [self._read_float() for _ in range(3)]
-			count0 = self._read_int()
-			if count0 < 0:
-				raise ValueError("Invalid billboard count0")
+			# Vertical billboards header
+			width = self._read_float()
+			top = self._read_float()
+			bottom = self._read_float()
+			num_billboards = self._read_int()
 
-			blob0_size = eSRT.BILLBOARD_BLOB0_FACTOR * count0
-			if self.pos + blob0_size > len(self.data):
-				raise ValueError("Billboard blob0 out of range")
-			blob0 = self._read_bytes(blob0_size)
+			if num_billboards < 0 or num_billboards > 10000:
+				return {"billboards": "Invalid vertical billboard count"}
 
-			flags_size = count0
-			if self.pos + flags_size > len(self.data):
-				raise ValueError("Billboard flags out of range")
-			raw_flags = self._read_bytes(flags_size)
+			# Texcoord table: 4 floats per billboard
+			texcoords_size = num_billboards * 4 * 4  # 4 floats * 4 bytes
+			if self.pos + texcoords_size > len(self.data):
+				return {"billboards": "Texcoord table out of range"}
+			texcoords_blob = self._read_bytes(texcoords_size)
+			texcoords = []
+			for i in range(0, len(texcoords_blob), 16):
+				tc = struct.unpack(self.endian + '4f', texcoords_blob[i:i+16])
+				texcoords.append(tc)
 
+			# Rotated flags (1 byte per billboard)
+			if self.pos + num_billboards > len(self.data):
+				return {"billboards": "Rotated flags out of range"}
+			rotated_flags = self._read_bytes(num_billboards)
 			self._align_to_4()
 
-			count1 = self._read_int()
-			count2 = self._read_int()
-			if count1 < 0 or count2 < 0:
-				raise ValueError("Invalid billboard count1/count2")
+			# Cutout vertices and indices counts
+			num_cutout_verts = self._read_int()
+			num_cutout_indices = self._read_int()
+			if num_cutout_verts < 0 or num_cutout_indices < 0:
+				return {"billboards": "Invalid cutout counts"}
 
-			verts2d_blob = b""
-			indices_blob = b""
-			if count1 > 0 and count2 > 0:
-				verts2d_size = 8 * count1
-				indices_size = 2 * count2
-				if self.pos + verts2d_size + indices_size > len(self.data):
-					raise ValueError("Billboard secondary data out of range")
-				verts2d_blob = self._read_bytes(verts2d_size)
+			cutout_vertices = []
+			cutout_indices = []
+			if num_cutout_verts > 0 and num_cutout_indices > 0:
+				verts_size = num_cutout_verts * 2 * 4  # 2 floats per vertex
+				if self.pos + verts_size > len(self.data):
+					return {"billboards": "Cutout vertices out of range"}
+				verts_blob = self._read_bytes(verts_size)
+				for i in range(0, verts_size, 8):
+					x, y = struct.unpack(self.endian + '2f', verts_blob[i:i+8])
+					cutout_vertices.append((x, y))
+
+				indices_size = num_cutout_indices * 2  # uint16
+				if self.pos + indices_size > len(self.data):
+					return {"billboards": "Cutout indices out of range"}
 				indices_blob = self._read_bytes(indices_size)
+				for i in range(0, indices_size, 2):
+					idx = struct.unpack(self.endian + 'H', indices_blob[i:i+2])[0]
+					cutout_indices.append(idx)
 				self._align_to_4()
 
-			footer = self._read_bytes(eSRT.BILLBOARD_FOOTER_SIZE)
-
-			vertices2d = []
-			for i in range(0, len(verts2d_blob), 8):
-				x, y = struct.unpack(self.endian + '2f', verts2d_blob[i:i + 8])
-				vertices2d.append((x, y))
-
-			indices = []
-			for i in range(0, len(indices_blob), 2):
-				idx = struct.unpack(self.endian + 'H', indices_blob[i:i + 2])[0]
-				indices.append(idx)
+			# Horizontal billboard (previously called footer)
+			horiz_size = eSRTConstants.HORIZONTAL_BILLBOARD_SIZE  # 1 int + 20 floats
+			if self.pos + horiz_size > len(self.data):
+				return {"billboards": "Horizontal billboard data out of range"}
+			h_present = self._read_int()
+			h_texcoords = [self._read_float() for _ in range(8)]
+			h_positions = []
+			for _ in range(4):
+				h_positions.append(tuple(self._read_float() for _ in range(3)))
 
 			return {
 				"billboards": {
-					"origin": origin,
-					"count0": count0,
-					"count1": count1,
-					"count2": count2,
-					"vertices2d": vertices2d,
-					"indices": indices,
-					"raw_flags": raw_flags,
-					"blob0": blob0,
-					"footer": footer,
+					"vertical": {
+						"width": width,
+						"top": top,
+						"bottom": bottom,
+						"num_billboards": num_billboards,
+						"texcoords": texcoords,
+						"rotated_flags": rotated_flags,
+						"num_cutout_vertices": num_cutout_verts,
+						"num_cutout_indices": num_cutout_indices,
+						"cutout_vertices": cutout_vertices,
+						"cutout_indices": cutout_indices,
+					},
+					"horizontal": {
+						"present": bool(h_present),
+						"texcoords": h_texcoords,
+						"positions": h_positions,
+					}
 				}
 			}
 		except Exception:
@@ -231,22 +271,24 @@ class SRTParser:
 	def _parse_custom_data(self):
 		if self.pos + 20 > len(self.data):
 			return {"custom_data": "Parse error"}
-		refs = [self._read_int() for _ in range(5)]
+		refs = [self._read_int() for _ in range(5)]   # CCore::USER_STRING_COUNT = 5
 		return {"custom_data": {"string_refs": refs}}
 
+
+	#  Render states (version 6 layout: primary + optional depth/shadow + copies) ---------------------------------------------------------
 	def _parse_render_states(self):
 		try:
 			if self.pos + 16 > len(self.data):
 				return {"render_states": "Parse error"}
 			state_count = self._read_int()
-			has_secondary = self._read_int() == 1
-			has_tertiary = self._read_int() == 1
-			render_mode = self._read_int()
+			has_secondary = self._read_int() == 1   # depth-only pass
+			has_tertiary = self._read_int() == 1    # shadow-cast pass
+			render_mode = self._read_int()          # shader path index (string)
 
 			if state_count < 0 or state_count > 4096:
 				return {"render_states": "Invalid count"}
 
-			block_size = eSRT.SIZE_RENDER_STATE_BLOCK
+			block_size = eSRTConstants.RENDER_STATE_SIZE
 			primary_size = state_count * block_size
 			if self.pos + primary_size > len(self.data):
 				return {"render_states": "Primary block out of range"}
@@ -266,12 +308,14 @@ class SRTParser:
 				tertiary_base = self.pos
 				self.pos += primary_size
 
+			# Billboard render state copies (1 per active pass + main)
 			copy_count = 1 + int(has_secondary) + int(has_tertiary)
 			for _ in range(copy_count):
 				if self.pos + block_size > len(self.data):
 					return {"render_states": "State copy out of range"}
 				self.pos += block_size
 
+			# Store only primary blocks for geometry creation
 			blocks = []
 			for i in range(state_count):
 				start = primary_base + i * block_size
@@ -293,6 +337,8 @@ class SRTParser:
 		except Exception as exc:
 			return {"render_states": f"Parse error: {exc}"}
 
+
+	#  3D geometry descriptors (SLod + SDrawCall + SBone) ---------------------------------------------------------
 	def _parse_3d_geometry_descriptors(self):
 		try:
 			num_lods = self._read_int()
@@ -300,33 +346,34 @@ class SRTParser:
 				return {"3d_geometry": "Invalid LOD count"}
 
 			lod_table_base = self.pos
-			lod_table_size = eSRT.SIZE_LOD_TABLE_ENTRY * num_lods
+			lod_table_size = eSRTConstants.LOD_TABLE_ENTRY_SIZE * num_lods
 			if self.pos + lod_table_size > len(self.data):
 				return {"3d_geometry": "LOD table out of range"}
 			self.pos += lod_table_size
 
 			lods = []
 			for lod_idx in range(num_lods):
-				lod_start = lod_table_base + lod_idx * eSRT.SIZE_LOD_TABLE_ENTRY
+				lod_start = lod_table_base + lod_idx * eSRTConstants.LOD_TABLE_ENTRY_SIZE
 				lod_words = struct.unpack(
 					self.endian + '6I',
-					self.data[lod_start:lod_start + eSRT.SIZE_LOD_TABLE_ENTRY]
+					self.data[lod_start:lod_start + eSRTConstants.LOD_TABLE_ENTRY_SIZE]
 				)
-				num_geoms = lod_words[0]
-				aux_count = lod_words[3]
+				num_geoms = lod_words[0]      # m_nNumDrawCalls
+				aux_count = lod_words[3]      # m_nNumBones
+
 				if num_geoms < 0 or num_geoms > 4096:
 					return {"3d_geometry": "Invalid geom count"}
 				if aux_count < 0 or aux_count > 4096:
 					return {"3d_geometry": "Invalid aux count"}
 
-				if self.pos + num_geoms * eSRT.SIZE_GEOM_DESCRIPTOR > len(self.data):
+				if self.pos + num_geoms * eSRTConstants.DRAW_CALL_SIZE > len(self.data):
 					return {"3d_geometry": "Geom descriptors out of range"}
 
 				geoms = []
 				for geom_idx in range(num_geoms):
 					geom_words = struct.unpack(
 						self.endian + '10I',
-						self._read_bytes(eSRT.SIZE_GEOM_DESCRIPTOR)
+						self._read_bytes(eSRTConstants.DRAW_CALL_SIZE)
 					)
 					geoms.append({
 						"geom": geom_idx,
@@ -338,7 +385,7 @@ class SRTParser:
 					})
 
 				aux_data = []
-				aux_bytes = aux_count * eSRT.SIZE_AUX_DATA_ENTRY
+				aux_bytes = aux_count * eSRTConstants.BONE_SIZE
 				if aux_count > 0:
 					if self.pos + aux_bytes > len(self.data):
 						return {"3d_geometry": "LOD aux data out of range"}
@@ -359,6 +406,7 @@ class SRTParser:
 			return {"3d_geometry": f"Parse error: {e}"}
 
 
+	#  Vertex data decoding helpers ---------------------------------------------------------
 	@staticmethod
 	def _read_half_float(buf, endian):
 		return struct.unpack(endian + 'e', buf)[0]
@@ -373,10 +421,10 @@ class SRTParser:
 		return 0.0
 
 	def _decode_semantic(self, vertex_blob, base, stride, vf_block, semantic_id):
-		desc_start = eSRT.VF_DESC_SIZE * (semantic_id + eSRT.VF_DESC_OFFSET)
-		if desc_start + eSRT.VF_DESC_SIZE > len(vf_block):
+		desc_start = eSRTConstants.VF_DESC_SIZE * (semantic_id + eSRTConstants.VF_DESC_OFFSET)
+		if desc_start + eSRTConstants.VF_DESC_SIZE > len(vf_block):
 			return []
-		desc = vf_block[desc_start:desc_start + eSRT.VF_DESC_SIZE]
+		desc = vf_block[desc_start:desc_start + eSRTConstants.VF_DESC_SIZE]
 		comp_type = desc[0]
 
 		component_count = sum(1 for c in desc[1:5] if c != 0xFF)
@@ -401,6 +449,8 @@ class SRTParser:
 			values.append(self._decode_component(raw, comp_type))
 		return values
 
+
+	#  Final vertex & index data ---------------------------------------------------------
 	def _parse_vertex_index_data(self):
 		raw_offset = self.pos
 		raw = self.data[raw_offset:]
@@ -427,7 +477,7 @@ class SRTParser:
 				if rs_index < 0 or rs_index >= len(self.render_states["blocks"]):
 					continue
 				vf_block = self.render_states["blocks"][rs_index]
-				stride = vf_block[eSRT.STRIDE_BYTE_OFFSET]
+				stride = vf_block[eSRTConstants.STRIDE_BYTE_OFFSET]
 				if stride <= 0:
 					continue
 
@@ -471,6 +521,7 @@ class SRTParser:
 						nrm_values = [0.0, 0.0, 1.0]
 					if len(uv_values) < 2:
 						uv_values = [0.0, 0.0]
+
 					vertices.append({
 						"pos": tuple(pos_values[:3]),
 						"normal": tuple(nrm_values[:3]),
