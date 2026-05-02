@@ -204,48 +204,47 @@ class IMPORT_OT_scots_pine_srt(bpy.types.Operator, ImportHelper):
 	filter_glob: StringProperty(default="*.srt", options={'HIDDEN'})  # type: ignore
 
 	def execute(self, context):
-		srt_path = Path(self.filepath)
-		if not srt_path.exists():
-			self.report({'ERROR'}, f"SRT file not found at {srt_path}")
-			return {'CANCELLED'}
-
-		parser = SRTParser(str(srt_path))
 		try:
-			parsed = parser.parse()
+			with open(self.filepath, 'rb') as f:
+				parsed = SRTParser(f.read()).parse()
 		except Exception as exc:
-			self.report({'ERROR'}, f"Failed to parse SRT: {exc}")
+			self.report({'ERROR'}, f"Failed to import SRT: {exc}")
 			return {'CANCELLED'}
 
+		srt_path = Path(self.filepath)
 		base_name = srt_path.stem
+		base_dir = srt_path.parent
+
 		vertex_index = parsed.get('vertex_index_data', {})
 		meshes = vertex_index.get('meshes', [])
 		string_table = parsed.get('string_table')
 		render_states = parsed.get('render_states')
-		materials = create_materials_from_render_states(string_table, render_states, srt_path.parent)
+
+		materials = create_materials_from_render_states(
+			string_table, render_states, base_dir
+		)
 
 		root_collection = get_or_create_collection(f"{base_name}_SRT")
 
-		# Group meshes by LOD
 		lods_dict = {}
 		for mesh_data in meshes:
 			lod = mesh_data.get('lod', 0)
 			rs_index = mesh_data.get('render_state_index')
 			if not materials or rs_index not in materials:
 				continue
-			if lod not in lods_dict:
-				lods_dict[lod] = []
-			lods_dict[lod].append((mesh_data, rs_index))
+			lods_dict.setdefault(lod, []).append((mesh_data, rs_index))
 
 		created_objects = 0
 
 		for lod in sorted(lods_dict.keys()):
-			lod_collection = get_or_create_collection(f"{base_name}_LOD{lod}", parent=root_collection)
+			lod_collection = get_or_create_collection(
+				f"{base_name}_LOD{lod}", parent=root_collection
+			)
 			lod_collection.hide_viewport = False
 			lod_collection.hide_render = False
-			lod_geoms = lods_dict[lod]
 
 			geom_objects = []
-			for mesh_data, rs_index in lod_geoms:
+			for mesh_data, rs_index in lods_dict[lod]:
 				geom = mesh_data.get('geom', 0)
 				rotation_x_90 = mathutils.Euler((math.radians(90), 0, 0), 'XYZ')
 				obj = create_mesh_from_3d(

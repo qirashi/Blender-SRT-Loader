@@ -1,11 +1,9 @@
 # imports
 import struct
-from pathlib import Path
 
 class SRTParser:
-	def __init__(self, filepath):
-		self.filepath = Path(filepath)
-		self.data = None
+	def __init__(self, data):
+		self.data = data
 		self.pos = 0
 		self.endian = '<'
 		self.is_native_endian = True
@@ -71,7 +69,6 @@ class SRTParser:
 
 	def parse_extents(self):
 		extents = [self.read_float() for _ in range(6)]
-		print("Raw extents:", extents)
 
 		if extents[0] > extents[3]:
 			extents[0], extents[3] = extents[3], extents[0]
@@ -491,10 +488,8 @@ class SRTParser:
 		}
 
 	def parse(self):
-		with open(self.filepath, 'rb') as f:
-			self.data = f.read()
-
 		result = {}
+
 		result.update(self.parse_header())
 		result.update(self.parse_platform())
 		result.update(self.parse_extents())
