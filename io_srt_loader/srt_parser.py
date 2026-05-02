@@ -1,6 +1,24 @@
 # imports
 import struct
 
+
+class eSRT:
+	SIZE_RENDER_STATE_BLOCK = 680
+	SIZE_GEOM_DESCRIPTOR    = 40
+	SIZE_LOD_TABLE_ENTRY    = 24
+	SIZE_AUX_DATA_ENTRY     = 48
+	SIZE_COLLISION_OBJECT   = 36
+
+	VF_DESC_OFFSET          = 33
+	VF_DESC_SIZE            = 13
+	STRIDE_BYTE_OFFSET      = 663
+
+	BILLBOARD_BLOB0_FACTOR  = 16
+	BILLBOARD_FOOTER_SIZE   = 84
+
+	ADDITIONAL_DATA_SIZE    = 31
+	WIND_DATA_SIZE          = 1308
+
 class SRTParser:
 	def __init__(self, data):
 		self.data = data
@@ -13,52 +31,49 @@ class SRTParser:
 		self.render_states = {"count": 0, "blocks": []}
 		self.geometry_descriptors = {"num_lods": 0, "lods": []}
 
-	def read_bytes(self, size):
+	def _read_bytes(self, size):
 		if self.pos + size > len(self.data):
 			raise ValueError(f"Premature end of file at position {self.pos}")
 		result = self.data[self.pos:self.pos + size]
 		self.pos += size
 		return result
 
-	def read_int(self):
-		return struct.unpack(self.endian + 'I', self.read_bytes(4))[0]
+	def _read_int(self):
+		return struct.unpack(self.endian + 'I', self._read_bytes(4))[0]
 
-	def read_float(self):
-		return struct.unpack(self.endian + 'f', self.read_bytes(4))[0]
+	def _read_float(self):
+		return struct.unpack(self.endian + 'f', self._read_bytes(4))[0]
 
-	def read_short(self):
-		return struct.unpack(self.endian + 'H', self.read_bytes(2))[0]
+	def _read_byte(self):
+		return self._read_bytes(1)[0]
 
-	def read_byte(self):
-		return self.read_bytes(1)[0]
-
-	def read_string(self):
+	def _read_string(self):
 		start = self.pos
 		while self.pos < len(self.data) and self.data[self.pos] != 0:
 			self.pos += 1
 		result = self.data[start:self.pos].decode('utf-8', errors='ignore')
-		self.pos += 1  # Пропуск null
+		self.pos += 1
 		return result
 
-	def align_to_4(self):
+	def _align_to_4(self):
 		while self.pos % 4 != 0:
 			self.pos += 1
 
-	def parse_header(self):
-		header = self.read_string()
+
+	def _parse_header(self):
+		header = self._read_string()
 		if header != "SRT 06.0.0":
 			raise ValueError(f"Invalid header: {header}")
-		# Пропуск заполнения до 16 байтов
-		self.pos = 16
+		self.pos = 16  # пропуск заполнения до границы 16 байт
 		return {"header": header}
 
-	def parse_platform(self):
-		self.endian_byte = self.read_byte()
-		self.coord_system = self.read_byte()
+	def _parse_platform(self):
+		self.endian_byte = self._read_byte()
+		self.coord_system = self._read_byte()
 		self.is_native_endian = self.endian_byte == 0
 		self.endian = '<' if self.is_native_endian else '>'
-		self.read_byte()
-		self.read_byte()
+		self._read_byte() # reserve?
+		self._read_byte() # reserve?
 		self.platform = {
 			'endian_byte': self.endian_byte,
 			'coord_system': self.coord_system,
@@ -67,9 +82,8 @@ class SRTParser:
 		}
 		return {"platform": self.platform}
 
-	def parse_extents(self):
-		extents = [self.read_float() for _ in range(6)]
-
+	def _parse_extents(self):
+		extents = [self._read_float() for _ in range(6)]
 		if extents[0] > extents[3]:
 			extents[0], extents[3] = extents[3], extents[0]
 		if extents[1] > extents[4]:
@@ -78,55 +92,53 @@ class SRTParser:
 			extents[2], extents[5] = extents[5], extents[2]
 		return {"extents": {"min": extents[:3], "max": extents[3:]}}
 
-	def parse_lod(self):
-		lod_enabled = self.read_int()
-		lod_data = [self.read_float() for _ in range(4)]
+	def _parse_lod(self):
+		lod_enabled = self._read_int()
+		lod_data = [self._read_float() for _ in range(4)]
 		return {"lod": {"enabled": bool(lod_enabled), "ranges": lod_data}}
 
-	def parse_wind(self):
-		wind_size = 1308
-		wind_data = self.read_bytes(wind_size)
+	def _parse_wind(self):
+		wind_data = self._read_bytes(eSRT.WIND_DATA_SIZE)
 		return {"wind": wind_data}
 
-	def parse_additional(self):
-		additional = self.read_bytes(31)
-		self.align_to_4()
+	def _parse_additional(self):
+		additional = self._read_bytes(eSRT.ADDITIONAL_DATA_SIZE)
+		self._align_to_4()
 		return {"additional": additional}
 
-	def parse_string_table_preamble(self):
+	def _parse_string_table_preamble(self):
 		preamble = {
-			"u32_0": self.read_int(),
-			"u32_1": self.read_int(),
-			"u32_2": self.read_int(),
-			"f32_0": self.read_float(),
+			"u32_0": self._read_int(),
+			"u32_1": self._read_int(),
+			"u32_2": self._read_int(),
+			"f32_0": self._read_float(),
 		}
 		return {"string_table_preamble": preamble}
 
-	def parse_string_table(self):
+	def _parse_string_table(self):
 		try:
-			count = self.read_int()
+			count = self._read_int()
 			if count > 10000 or self.pos + count * 8 > len(self.data):
 				return {"string_table": "Invalid count or insufficient data"}
 
 			entries = []
 			for _ in range(count):
-				size_a = self.read_int()
-				size_b = self.read_int()
+				size_a = self._read_int()
+				size_b = self._read_int()
 				entries.append({"size_a": size_a, "size_b": size_b})
 
 			strings_base = self.pos
 			strings = []
 			total_string_bytes = 0
 			for entry in entries:
-				# В наблюдаемых образцах SRT 06.0.0 параметр size_b содержит длину строки ANSI
 				chunk_len = entry["size_b"]
 				if chunk_len < 0 or self.pos + chunk_len > len(self.data):
 					break
-				raw_string = self.read_bytes(chunk_len)
+				raw_string = self._read_bytes(chunk_len)
 				strings.append(raw_string.rstrip(b'\x00').decode('utf-8', errors='ignore'))
 				total_string_bytes += chunk_len
 
-			self.align_to_4()
+			self._align_to_4()
 			self.string_table_entries = entries
 			self.string_data_base = strings_base
 			return {
@@ -141,40 +153,39 @@ class SRTParser:
 		except Exception:
 			return {"string_table": "Parse error"}
 
-	def parse_collision_objects(self):
+	def _parse_collision_objects(self):
 		try:
-			count = self.read_int()
-			if count > 1000 or self.pos + count * 36 > len(self.data):
+			count = self._read_int()
+			if count > 1000 or self.pos + count * eSRT.SIZE_COLLISION_OBJECT > len(self.data):
 				return {"collision_objects": "Invalid count or insufficient data"}
 			objects = []
 			for _ in range(count):
-				obj_data = self.read_bytes(36)
-				objects.append(obj_data)
+				objects.append(self._read_bytes(eSRT.SIZE_COLLISION_OBJECT))
 			return {"collision_objects": {"count": count, "objects": objects}}
-		except:
+		except Exception:
 			return {"collision_objects": "Parse error"}
 
-	def parse_billboards(self):
+	def _parse_billboards(self):
 		try:
-			origin = [self.read_float() for _ in range(3)]
-			count0 = self.read_int()
+			origin = [self._read_float() for _ in range(3)]
+			count0 = self._read_int()
 			if count0 < 0:
 				raise ValueError("Invalid billboard count0")
 
-			blob0_size = 16 * count0
+			blob0_size = eSRT.BILLBOARD_BLOB0_FACTOR * count0
 			if self.pos + blob0_size > len(self.data):
 				raise ValueError("Billboard blob0 out of range")
-			blob0 = self.read_bytes(blob0_size)
+			blob0 = self._read_bytes(blob0_size)
 
 			flags_size = count0
 			if self.pos + flags_size > len(self.data):
 				raise ValueError("Billboard flags out of range")
-			raw_flags = self.read_bytes(flags_size)
+			raw_flags = self._read_bytes(flags_size)
 
-			self.align_to_4()
+			self._align_to_4()
 
-			count1 = self.read_int()
-			count2 = self.read_int()
+			count1 = self._read_int()
+			count2 = self._read_int()
 			if count1 < 0 or count2 < 0:
 				raise ValueError("Invalid billboard count1/count2")
 
@@ -185,11 +196,11 @@ class SRTParser:
 				indices_size = 2 * count2
 				if self.pos + verts2d_size + indices_size > len(self.data):
 					raise ValueError("Billboard secondary data out of range")
-				verts2d_blob = self.read_bytes(verts2d_size)
-				indices_blob = self.read_bytes(indices_size)
-				self.align_to_4()
+				verts2d_blob = self._read_bytes(verts2d_size)
+				indices_blob = self._read_bytes(indices_size)
+				self._align_to_4()
 
-			footer = self.read_bytes(84)
+			footer = self._read_bytes(eSRT.BILLBOARD_FOOTER_SIZE)
 
 			vertices2d = []
 			for i in range(0, len(verts2d_blob), 8):
@@ -217,25 +228,25 @@ class SRTParser:
 		except Exception:
 			return {"billboards": "Parse error"}
 
-	def parse_custom_data(self):
+	def _parse_custom_data(self):
 		if self.pos + 20 > len(self.data):
 			return {"custom_data": "Parse error"}
-		refs = [self.read_int() for _ in range(5)]
+		refs = [self._read_int() for _ in range(5)]
 		return {"custom_data": {"string_refs": refs}}
 
-	def parse_render_states(self):
+	def _parse_render_states(self):
 		try:
 			if self.pos + 16 > len(self.data):
 				return {"render_states": "Parse error"}
-			state_count = self.read_int()
-			has_secondary = self.read_int() == 1
-			has_tertiary = self.read_int() == 1
-			_render_mode = self.read_int()
+			state_count = self._read_int()
+			has_secondary = self._read_int() == 1
+			has_tertiary = self._read_int() == 1
+			render_mode = self._read_int()
 
 			if state_count < 0 or state_count > 4096:
 				return {"render_states": "Invalid count"}
 
-			block_size = 680
+			block_size = eSRT.SIZE_RENDER_STATE_BLOCK
 			primary_size = state_count * block_size
 			if self.pos + primary_size > len(self.data):
 				return {"render_states": "Primary block out of range"}
@@ -272,6 +283,7 @@ class SRTParser:
 					"count": state_count,
 					"has_secondary": has_secondary,
 					"has_tertiary": has_tertiary,
+					"render_mode": render_mode,
 					"primary_base": primary_base,
 					"secondary_base": secondary_base,
 					"tertiary_base": tertiary_base,
@@ -281,22 +293,25 @@ class SRTParser:
 		except Exception as exc:
 			return {"render_states": f"Parse error: {exc}"}
 
-	def parse_3d_geometry_descriptors(self):
+	def _parse_3d_geometry_descriptors(self):
 		try:
-			num_lods = self.read_int()
+			num_lods = self._read_int()
 			if num_lods < 0 or num_lods > 256:
 				return {"3d_geometry": "Invalid LOD count"}
 
 			lod_table_base = self.pos
-			lod_table_size = 24 * num_lods
+			lod_table_size = eSRT.SIZE_LOD_TABLE_ENTRY * num_lods
 			if self.pos + lod_table_size > len(self.data):
 				return {"3d_geometry": "LOD table out of range"}
 			self.pos += lod_table_size
 
 			lods = []
 			for lod_idx in range(num_lods):
-				lod_start = lod_table_base + lod_idx * 24
-				lod_words = struct.unpack(self.endian + '6I', self.data[lod_start:lod_start + 24])
+				lod_start = lod_table_base + lod_idx * eSRT.SIZE_LOD_TABLE_ENTRY
+				lod_words = struct.unpack(
+					self.endian + '6I',
+					self.data[lod_start:lod_start + eSRT.SIZE_LOD_TABLE_ENTRY]
+				)
 				num_geoms = lod_words[0]
 				aux_count = lod_words[3]
 				if num_geoms < 0 or num_geoms > 4096:
@@ -304,45 +319,45 @@ class SRTParser:
 				if aux_count < 0 or aux_count > 4096:
 					return {"3d_geometry": "Invalid aux count"}
 
-				if self.pos + num_geoms * 40 > len(self.data):
+				if self.pos + num_geoms * eSRT.SIZE_GEOM_DESCRIPTOR > len(self.data):
 					return {"3d_geometry": "Geom descriptors out of range"}
 
 				geoms = []
 				for geom_idx in range(num_geoms):
-					geom_words = struct.unpack(self.endian + '10I', self.read_bytes(40))
-					geoms.append(
-						{
-							"geom": geom_idx,
-							"render_state_index": geom_words[2],
-							"num_vertices": geom_words[3],
-							"num_indices": geom_words[6],
-							"is_index_32": bool(geom_words[7] & 0xFF),
-							"raw_words": list(geom_words),
-						}
+					geom_words = struct.unpack(
+						self.endian + '10I',
+						self._read_bytes(eSRT.SIZE_GEOM_DESCRIPTOR)
 					)
+					geoms.append({
+						"geom": geom_idx,
+						"render_state_index": geom_words[2],
+						"num_vertices": geom_words[3],
+						"num_indices": geom_words[6],
+						"is_index_32": bool(geom_words[7] & 0xFF),
+						"raw_words": list(geom_words),
+					})
 
 				aux_data = []
-				aux_bytes = aux_count * 48
+				aux_bytes = aux_count * eSRT.SIZE_AUX_DATA_ENTRY
 				if aux_count > 0:
 					if self.pos + aux_bytes > len(self.data):
 						return {"3d_geometry": "LOD aux data out of range"}
-					aux_data = self.read_bytes(aux_bytes).hex()
+					aux_data = self._read_bytes(aux_bytes).hex()
 
-				lods.append(
-					{
-						"lod": lod_idx,
-						"num_geoms": num_geoms,
-						"aux_count": aux_count,
-						"lod_words": list(lod_words),
-						"geoms": geoms,
-						"aux_data": aux_data,
-					}
-				)
+				lods.append({
+					"lod": lod_idx,
+					"num_geoms": num_geoms,
+					"aux_count": aux_count,
+					"lod_words": list(lod_words),
+					"geoms": geoms,
+					"aux_data": aux_data,
+				})
 
 			self.geometry_descriptors = {"num_lods": num_lods, "lods": lods}
 			return {"3d_geometry": {"num_lods": num_lods, "lods": lods}}
 		except Exception as e:
 			return {"3d_geometry": f"Parse error: {e}"}
+
 
 	@staticmethod
 	def _read_half_float(buf, endian):
@@ -358,12 +373,12 @@ class SRTParser:
 		return 0.0
 
 	def _decode_semantic(self, vertex_blob, base, stride, vf_block, semantic_id):
-		desc_start = 13 * (semantic_id + 33)
-		if desc_start + 13 > len(vf_block):
+		desc_start = eSRT.VF_DESC_SIZE * (semantic_id + eSRT.VF_DESC_OFFSET)
+		if desc_start + eSRT.VF_DESC_SIZE > len(vf_block):
 			return []
-		desc = vf_block[desc_start:desc_start + 13]
+		desc = vf_block[desc_start:desc_start + eSRT.VF_DESC_SIZE]
 		comp_type = desc[0]
-		# Component mask is stored in desc[1:5] with 0xFF as "absent".
+
 		component_count = sum(1 for c in desc[1:5] if c != 0xFF)
 		if component_count <= 0:
 			return []
@@ -374,6 +389,7 @@ class SRTParser:
 			offsets.append(off)
 			if len(offsets) >= component_count:
 				break
+
 		values = []
 		component_size = 4 if comp_type == 0 else 2 if comp_type == 1 else 1
 		for off in offsets:
@@ -385,7 +401,7 @@ class SRTParser:
 			values.append(self._decode_component(raw, comp_type))
 		return values
 
-	def parse_vertex_index_data(self):
+	def _parse_vertex_index_data(self):
 		raw_offset = self.pos
 		raw = self.data[raw_offset:]
 		meshes = []
@@ -411,7 +427,7 @@ class SRTParser:
 				if rs_index < 0 or rs_index >= len(self.render_states["blocks"]):
 					continue
 				vf_block = self.render_states["blocks"][rs_index]
-				stride = vf_block[663]
+				stride = vf_block[eSRT.STRIDE_BYTE_OFFSET]
 				if stride <= 0:
 					continue
 
@@ -428,7 +444,7 @@ class SRTParser:
 				index_blob = self.data[self.pos:self.pos + index_blob_size]
 				self.pos += index_blob_size
 
-				self.align_to_4()
+				self._align_to_4()
 
 				indices = []
 				for i in range(num_indices):
@@ -450,33 +466,28 @@ class SRTParser:
 					if len(uv_values) < 2:
 						uv_values = self._decode_semantic(vertex_blob, base, stride, vf_block, 14)
 					if len(pos_values) < 3:
-
 						pos_values = list(struct.unpack(self.endian + '3f', vertex_blob[base:base + 12]))
 					if len(nrm_values) < 3:
 						nrm_values = [0.0, 0.0, 1.0]
 					if len(uv_values) < 2:
 						uv_values = [0.0, 0.0]
-					vertices.append(
-						{
-							"pos": tuple(pos_values[:3]),
-							"normal": tuple(nrm_values[:3]),
-							"uv": (uv_values[0], uv_values[1]),
-						}
-					)
+					vertices.append({
+						"pos": tuple(pos_values[:3]),
+						"normal": tuple(nrm_values[:3]),
+						"uv": (uv_values[0], uv_values[1]),
+					})
 
-				meshes.append(
-					{
-						"lod": lod_idx,
-						"geom": geom_idx,
-						"num_vertices": num_vertices,
-						"num_indices": num_indices,
-						"stride": stride,
-						"render_state_index": rs_index,
-						"vertices": vertices,
-						"indices": indices,
-						"index_size": index_size,
-					}
-				)
+				meshes.append({
+					"lod": lod_idx,
+					"geom": geom_idx,
+					"num_vertices": num_vertices,
+					"num_indices": num_indices,
+					"stride": stride,
+					"render_state_index": rs_index,
+					"vertices": vertices,
+					"indices": indices,
+					"index_size": index_size,
+				})
 
 		return {
 			"vertex_index_data": {
@@ -489,20 +500,18 @@ class SRTParser:
 
 	def parse(self):
 		result = {}
-
-		result.update(self.parse_header())
-		result.update(self.parse_platform())
-		result.update(self.parse_extents())
-		result.update(self.parse_lod())
-		result.update(self.parse_wind())
-		result.update(self.parse_additional())
-		result.update(self.parse_string_table_preamble())
-		result.update(self.parse_string_table())
-		result.update(self.parse_collision_objects())
-		result.update(self.parse_billboards())
-		result.update(self.parse_custom_data())
-		result.update(self.parse_render_states())
-		result.update(self.parse_3d_geometry_descriptors())
-		result.update(self.parse_vertex_index_data())
-
+		result.update(self._parse_header())
+		result.update(self._parse_platform())
+		result.update(self._parse_extents())
+		result.update(self._parse_lod())
+		result.update(self._parse_wind())
+		result.update(self._parse_additional())
+		result.update(self._parse_string_table_preamble())
+		result.update(self._parse_string_table())
+		result.update(self._parse_collision_objects())
+		result.update(self._parse_billboards())
+		result.update(self._parse_custom_data())
+		result.update(self._parse_render_states())
+		result.update(self._parse_3d_geometry_descriptors())
+		result.update(self._parse_vertex_index_data())
 		return result
