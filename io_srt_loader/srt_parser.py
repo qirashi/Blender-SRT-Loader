@@ -9,7 +9,14 @@ class CoordSysType:
 	Z_UP_LEFT = 3
 
 class eSRTConstants:
-	RENDER_STATE_SIZE           = 680
+	WIND_V6_DATA_SIZE           = 1308
+	WIND_V7_DATA_SIZE           = 1308
+
+	ADDITIONAL_V6_DATA_SIZE     = 31
+
+	RENDER_STATE_V6_SIZE        = 680
+	RENDER_STATE_V7_SIZE        = 804
+
 	DRAW_CALL_SIZE              = 40
 	LOD_TABLE_ENTRY_SIZE        = 24
 	BONE_SIZE                   = 48
@@ -21,12 +28,10 @@ class eSRTConstants:
 
 	HORIZONTAL_BILLBOARD_SIZE   = 84  # 1 int + 20 floats
 
-	ADDITIONAL_DATA_SIZE        = 31
-	WIND_DATA_SIZE              = 1308
-
 class SRTParser:
 	def __init__(self, data):
 		self.data = data
+		self.version = None
 		self.pos = 0
 		self.endian = '<'
 		self.is_native_endian = True
@@ -52,14 +57,6 @@ class SRTParser:
 	def _read_byte(self):
 		return self._read_bytes(1)[0]
 
-	def _read_string(self):
-		start = self.pos
-		while self.pos < len(self.data) and self.data[self.pos] != 0:
-			self.pos += 1
-		result = self.data[start:self.pos].decode('utf-8', errors='ignore')
-		self.pos += 1
-		return result
-
 	def _align_to_4(self):
 		while self.pos % 4 != 0:
 			self.pos += 1
@@ -67,11 +64,18 @@ class SRTParser:
 
 	#  Top-level parse sections ---------------------------------------------------------
 	def _parse_header(self):
-		header = self._read_string()
-		if header != "SRT 06.0.0":
-			raise ValueError(f"Invalid header: {header}")
-		self.pos = 16  # skip padding to 16-byte boundary
-		return {"header": header}
+		raw = self._read_bytes(16)
+
+		header = raw.rstrip(b'\x00').decode('ascii')
+		if header == "SRT 06.0.0":
+			self.version = 6
+		elif header == "SRT 07.0.0":
+			self.version = 7
+		else:
+			raise ValueError(f"Unsupported SRT header: {header!r}")
+
+		print(f"Header: {header}, version: {self.version}")
+		return {"header": header, "version": self.version}
 
 	def _parse_platform(self):
 		"""Matches C++ CParser::ParsePlatform: endian byte, coord system, texcoords flipped, reserved"""
@@ -108,28 +112,34 @@ class SRTParser:
 		lod_data = [self._read_float() for _ in range(4)]
 		return {"lod": {"enabled": bool(lod_enabled), "ranges": lod_data}}
 
-	def _parse_wind(self):
+	def _parse_wind_v6(self):
 		"""Wind parameters blob of fixed size (covers SPairParams + options + tree data)"""
-		wind_data = self._read_bytes(eSRTConstants.WIND_DATA_SIZE)
+		wind_data = self._read_bytes(eSRTConstants.WIND_V6_DATA_SIZE)
 		return {"wind": wind_data}
 
-	def _parse_additional(self):
-		additional = self._read_bytes(eSRTConstants.ADDITIONAL_DATA_SIZE)
+	def _parse_wind_v7(self):
+		"""Wind parameters blob of fixed size (covers SPairParams + options + tree data)"""
+		wind_data = self._read_bytes(eSRTConstants.WIND_V7_DATA_SIZE)
+		return {"wind": wind_data}
+
+	def _parse_additional_v6(self):
+		additional = self._read_bytes(eSRTConstants.ADDITIONAL_V6_DATA_SIZE)
 		self._align_to_4()
 		return {"additional": additional}
 
-	def _parse_string_table_preamble(self):
-		preamble = {
-			"u32_0": self._read_int(),
-			"u32_1": self._read_int(),
-			"u32_2": self._read_int(),
-			"f32_0": self._read_float(),
-		}
-		return {"string_table_preamble": preamble}
-
 	def _parse_string_table(self):
-		"""Matches CParser::ParseStringTable: count, padded lengths, then string data"""
+		"""Matches CParser::ParseStringTable: count, padded lengths, then string data."""
 		try:
+			if self.version == 6:
+				preamble = {
+					"u32_0": self._read_int(),
+					"u32_1": self._read_int(),
+					"u32_2": self._read_int(),
+					"f32_0": self._read_float(),
+				}
+			else:
+				preamble = None
+
 			count = self._read_int()
 			if count > 10000 or self.pos + count * 8 > len(self.data):
 				return {"string_table": "Invalid count or insufficient data"}
@@ -154,7 +164,8 @@ class SRTParser:
 			self._align_to_4()
 			self.string_table_entries = entries
 			self.string_data_base = strings_base
-			return {
+
+			result = {
 				"string_table": {
 					"count": count,
 					"entries": entries,
@@ -163,6 +174,10 @@ class SRTParser:
 					"total_string_bytes": total_string_bytes,
 				}
 			}
+			if preamble is not None:
+				result["string_table_preamble"] = preamble
+
+			return result
 		except Exception:
 			return {"string_table": "Parse error"}
 
@@ -275,20 +290,24 @@ class SRTParser:
 		return {"custom_data": {"string_refs": refs}}
 
 
-	#  Render states (version 6 layout: primary + optional depth/shadow + copies) ---------------------------------------------------------
+	#  Render states ---------------------------------------------------------
 	def _parse_render_states(self):
 		try:
+			if self.version == 7:
+				block_size = eSRTConstants.RENDER_STATE_V7_SIZE
+			else:
+				block_size = eSRTConstants.RENDER_STATE_V6_SIZE
+
 			if self.pos + 16 > len(self.data):
 				return {"render_states": "Parse error"}
 			state_count = self._read_int()
-			has_secondary = self._read_int() == 1   # depth-only pass
-			has_tertiary = self._read_int() == 1    # shadow-cast pass
-			render_mode = self._read_int()          # shader path index (string)
+			has_secondary = self._read_int() == 1 # depth-only pass
+			has_tertiary = self._read_int() == 1  # shadow-cast pass
+			render_mode = self._read_int()        # shader path index
 
 			if state_count < 0 or state_count > 4096:
 				return {"render_states": "Invalid count"}
 
-			block_size = eSRTConstants.RENDER_STATE_SIZE
 			primary_size = state_count * block_size
 			if self.pos + primary_size > len(self.data):
 				return {"render_states": "Primary block out of range"}
@@ -308,14 +327,12 @@ class SRTParser:
 				tertiary_base = self.pos
 				self.pos += primary_size
 
-			# Billboard render state copies (1 per active pass + main)
 			copy_count = 1 + int(has_secondary) + int(has_tertiary)
 			for _ in range(copy_count):
 				if self.pos + block_size > len(self.data):
 					return {"render_states": "State copy out of range"}
 				self.pos += block_size
 
-			# Store only primary blocks for geometry creation
 			blocks = []
 			for i in range(state_count):
 				start = primary_base + i * block_size
@@ -455,6 +472,7 @@ class SRTParser:
 		raw_offset = self.pos
 		raw = self.data[raw_offset:]
 		meshes = []
+
 		if not self.geometry_descriptors.get("lods"):
 			return {
 				"vertex_index_data": {
@@ -466,20 +484,22 @@ class SRTParser:
 			}
 
 		for lod in self.geometry_descriptors["lods"]:
-			lod_idx = lod["lod"]
 			for geom in lod["geoms"]:
-				geom_idx = geom["geom"]
 				rs_index = geom["render_state_index"]
-				num_vertices = geom["num_vertices"]
-				num_indices = geom["num_indices"]
-				is_index_32 = geom["is_index_32"]
-
 				if rs_index < 0 or rs_index >= len(self.render_states["blocks"]):
 					continue
 				vf_block = self.render_states["blocks"][rs_index]
-				stride = vf_block[eSRTConstants.STRIDE_BYTE_OFFSET]
+
+				if self.version == 7:
+					stride = struct.unpack(self.endian + 'I', vf_block[0:4])[0]
+				else:
+					stride = vf_block[eSRTConstants.STRIDE_BYTE_OFFSET]
 				if stride <= 0:
 					continue
+
+				num_vertices = geom["num_vertices"]
+				num_indices = geom["num_indices"]
+				is_index_32 = geom["is_index_32"]
 
 				vertex_blob_size = num_vertices * stride
 				if self.pos + vertex_blob_size > len(self.data):
@@ -500,9 +520,9 @@ class SRTParser:
 				for i in range(num_indices):
 					start = i * index_size
 					if index_size == 4:
-						indices.append(struct.unpack(self.endian + 'I', index_blob[start:start + 4])[0])
+						indices.append(struct.unpack(self.endian + 'I', index_blob[start:start+4])[0])
 					else:
-						indices.append(struct.unpack(self.endian + 'H', index_blob[start:start + 2])[0])
+						indices.append(struct.unpack(self.endian + 'H', index_blob[start:start+2])[0])
 
 				vertices = []
 				for v_idx in range(num_vertices):
@@ -529,8 +549,8 @@ class SRTParser:
 					})
 
 				meshes.append({
-					"lod": lod_idx,
-					"geom": geom_idx,
+					"lod": lod["lod"],
+					"geom": geom["geom"],
 					"num_vertices": num_vertices,
 					"num_indices": num_indices,
 					"stride": stride,
@@ -555,9 +575,11 @@ class SRTParser:
 		result.update(self._parse_platform())
 		result.update(self._parse_extents())
 		result.update(self._parse_lod())
-		result.update(self._parse_wind())
-		result.update(self._parse_additional())
-		result.update(self._parse_string_table_preamble())
+		if self.version == 7:
+			result.update(self._parse_wind_v7())
+		elif self.version == 6:
+			result.update(self._parse_wind_v6())
+			result.update(self._parse_additional_v6())
 		result.update(self._parse_string_table())
 		result.update(self._parse_collision_objects())
 		result.update(self._parse_billboards())
